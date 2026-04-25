@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -320,6 +322,218 @@ def _normalize_role(r: Optional[str]) -> str:
         return r_norm
     logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
     return "leaf"
+
+
+def _resolve_ams_bridge_config(parent_agent=None) -> Optional[Dict[str, Any]]:
+    """Return normalized AMS bridge config for delegate_task, or None if disabled."""
+    cfg = _load_config()
+    bridge = cfg.get("ams_bridge") if isinstance(cfg, dict) else None
+    if not isinstance(bridge, dict):
+        return None
+    if not is_truthy_value(bridge.get("enabled"), default=False):
+        return None
+
+    base_url = str(
+        bridge.get("base_url") or os.getenv("AMS_SERVER_URL") or ""
+    ).strip().rstrip("/")
+    api_key = str(bridge.get("api_key") or os.getenv("AMS_API_KEY") or "").strip()
+    if not base_url or not api_key:
+        logger.warning("delegate_task AMS bridge enabled but base_url/api_key missing")
+        return None
+
+    agent_id = str(bridge.get("agent_id") or "hermes-agent").strip() or "hermes-agent"
+    agent_name = str(bridge.get("agent_name") or "Hermes Agent").strip() or agent_id
+    tenant_id = str(bridge.get("tenant_id") or "default").strip() or "default"
+    configured_instance = str(bridge.get("instance_id") or "").strip()
+    parent_session_id = getattr(parent_agent, "session_id", None)
+    if isinstance(parent_session_id, str):
+        parent_session_id = parent_session_id.strip() or None
+    instance_id = configured_instance or parent_session_id or f"hermes-{os.getpid()}"
+
+    user_id = str(bridge.get("user_id") or "").strip() or None
+    timeout_seconds_raw = bridge.get("timeout_seconds", 3.0)
+    try:
+        timeout_seconds = max(0.1, float(timeout_seconds_raw))
+    except (TypeError, ValueError):
+        timeout_seconds = 3.0
+
+    return {
+        "base_url": base_url,
+        "api_key": api_key,
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "tenant_id": tenant_id,
+        "instance_id": instance_id,
+        "user_id": user_id,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def _ams_bridge_post(
+    bridge: Dict[str, Any], path: str, payload: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    url = f"{bridge['base_url']}{path}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-API-Key": bridge["api_key"],
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=bridge["timeout_seconds"]) as resp:
+        body = resp.read().decode("utf-8")
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except Exception:
+        return None
+
+
+def _ensure_ams_bridge_agent_registered(bridge: Dict[str, Any], model: Optional[str]) -> None:
+    metadata = {
+        "source": "hermes-delegate_task",
+        "transport": "delegate_task",
+        "model": model,
+        "instanceId": bridge["instance_id"],
+    }
+    _ams_bridge_post(
+        bridge,
+        "/api/fleet/agents",
+        {
+            "agentId": bridge["agent_id"],
+            "tenantId": bridge["tenant_id"],
+            "agentName": bridge["agent_name"],
+            "instanceId": bridge["instance_id"],
+            "metadata": metadata,
+        },
+    )
+
+
+def _register_ams_bridge_execution(
+    bridge: Dict[str, Any], *, execution_id: str, task: str, model: Optional[str]
+) -> Optional[str]:
+    try:
+        _ensure_ams_bridge_agent_registered(bridge, model)
+        response = _ams_bridge_post(
+            bridge,
+            "/api/fleet/executions/register",
+            {
+                "agentId": bridge["agent_id"],
+                "tenantId": bridge["tenant_id"],
+                "executionId": execution_id,
+                "agentName": bridge["agent_name"],
+                "task": task,
+                "model": model or "unknown",
+                "instanceId": bridge["instance_id"],
+                "userId": bridge.get("user_id"),
+            },
+        )
+        return response.get("executionId") if isinstance(response, dict) else None
+    except Exception as exc:
+        logger.warning("delegate_task AMS bridge registration failed: %s", exc)
+        return None
+
+
+def _emit_ams_bridge_chunk(
+    bridge: Dict[str, Any], execution_id: str, chunk_type: str, data: Dict[str, Any]
+) -> None:
+    _ams_bridge_post(
+        bridge,
+        f"/api/fleet/executions/{execution_id}/emit",
+        {
+            "agentId": bridge["agent_id"],
+            "tenantId": bridge["tenant_id"],
+            "executionId": execution_id,
+            "type": chunk_type,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "data": data,
+        },
+    )
+
+
+def _complete_ams_bridge_execution(
+    bridge: Dict[str, Any],
+    execution_id: str,
+    *,
+    error: Optional[str] = None,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+) -> None:
+    payload: Dict[str, Any] = {
+        "tokensIn": int(tokens_in or 0),
+        "tokensOut": int(tokens_out or 0),
+        "cost": 0.0,
+    }
+    if error:
+        payload["error"] = error
+    _ams_bridge_post(bridge, f"/api/fleet/executions/{execution_id}/complete", payload)
+
+
+def _bridge_subagent_event_to_ams(
+    bridge: Dict[str, Any],
+    execution_id: str,
+    event_type: str,
+    tool_name: str = None,
+    preview: str = None,
+    args=None,
+    **kwargs,
+) -> None:
+    try:
+        if event_type == "subagent.start":
+            _emit_ams_bridge_chunk(
+                bridge,
+                execution_id,
+                "start",
+                {"content": preview or kwargs.get("goal") or "", "model": kwargs.get("model")},
+            )
+            return
+        if event_type == "subagent.tool":
+            _emit_ams_bridge_chunk(
+                bridge,
+                execution_id,
+                "tool_call",
+                {
+                    "toolName": tool_name or "unknown",
+                    "toolInput": args if isinstance(args, dict) else {},
+                },
+            )
+            return
+        if event_type in {"subagent.progress", "subagent.thinking"}:
+            if preview:
+                _emit_ams_bridge_chunk(
+                    bridge, execution_id, "output", {"content": str(preview)}
+                )
+            return
+        if event_type == "subagent.complete":
+            status = str(kwargs.get("status") or "completed")
+            summary = kwargs.get("summary") or preview or ""
+            if summary:
+                _emit_ams_bridge_chunk(
+                    bridge, execution_id, "output", {"content": str(summary)}
+                )
+            if status in {"failed", "error", "timeout", "interrupted"}:
+                _emit_ams_bridge_chunk(
+                    bridge,
+                    execution_id,
+                    "error",
+                    {"error": summary or status},
+                )
+            else:
+                _emit_ams_bridge_chunk(
+                    bridge,
+                    execution_id,
+                    "complete",
+                    {
+                        "tokensIn": int(kwargs.get("input_tokens") or 0),
+                        "tokensOut": int(kwargs.get("output_tokens") or 0),
+                        "durationMs": int(float(kwargs.get("duration_seconds") or 0) * 1000),
+                    },
+                )
+    except Exception as exc:
+        logger.debug("delegate_task AMS bridge event relay failed: %s", exc)
 
 
 def _get_max_concurrent_children() -> int:
@@ -656,6 +870,7 @@ def _build_child_progress_callback(
     depth: Optional[int] = None,
     model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
+    bridge_event_callback=None,
 ) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -709,10 +924,15 @@ def _build_child_progress_callback(
     def _relay(
         event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs
     ):
-        if not parent_cb:
-            return
         payload = _identity_kwargs()
         payload.update(kwargs)  # caller overrides (e.g. status, duration_seconds)
+        if bridge_event_callback:
+            try:
+                bridge_event_callback(event_type, tool_name, preview, args, **payload)
+            except Exception as e:
+                logger.debug("AMS bridge callback failed: %s", e)
+        if not parent_cb:
+            return
         try:
             parent_cb(event_type, tool_name, preview, args, **payload)
         except Exception as e:
@@ -813,8 +1033,8 @@ def _build_child_progress_callback(
             except Exception as e:
                 logger.debug("Spinner print_above failed: %s", e)
 
+        _relay("subagent.tool", tool_name, preview, args)
         if parent_cb:
-            _relay("subagent.tool", tool_name, preview, args)
             _batch.append(tool_name or "")
             if len(_batch) >= _BATCH_SIZE:
                 summary = ", ".join(_batch)
@@ -946,6 +1166,29 @@ def _build_child_agent(
     # Resolve the child's effective model early so it can ride on every event.
     effective_model_for_cb = model or getattr(parent_agent, "model", None)
 
+    ams_bridge = _resolve_ams_bridge_config(parent_agent)
+    bridge_execution_id = None
+    bridge_event_callback = None
+    if ams_bridge and subagent_id:
+        bridge_execution_id = subagent_id
+        _register_ams_bridge_execution(
+            ams_bridge,
+            execution_id=bridge_execution_id,
+            task=goal,
+            model=effective_model_for_cb,
+        )
+
+        def bridge_event_callback(event_type, tool_name=None, preview=None, args=None, **kwargs):
+            _bridge_subagent_event_to_ams(
+                ams_bridge,
+                bridge_execution_id,
+                event_type,
+                tool_name=tool_name,
+                preview=preview,
+                args=args,
+                **kwargs,
+            )
+
     # Build progress callback to relay tool calls to parent display.
     # Identity kwargs thread the subagent_id through every emitted event so the
     # TUI can reconstruct the spawn tree and route per-branch controls.
@@ -959,6 +1202,7 @@ def _build_child_agent(
         depth=tui_depth,
         model=effective_model_for_cb,
         toolsets=child_toolsets,
+        bridge_event_callback=bridge_event_callback,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -1244,6 +1488,10 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+
+    _raw_sid = getattr(child, "_subagent_id", None)
+    bridge_execution_id = _raw_sid if isinstance(_raw_sid, str) else None
+    ams_bridge = _resolve_ams_bridge_config(parent_agent) if bridge_execution_id else None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -1713,6 +1961,18 @@ def _run_single_child(
                 child_progress_cb("subagent.complete", **complete_kwargs)
             except Exception as e:
                 logger.debug("Progress callback completion failed: %s", e)
+
+        if bridge_execution_id:
+            try:
+                _complete_ams_bridge_execution(
+                    ams_bridge,
+                    bridge_execution_id,
+                    error=entry.get("error"),
+                    tokens_in=int(_input_tokens) if isinstance(_input_tokens, (int, float)) else 0,
+                    tokens_out=int(_output_tokens) if isinstance(_output_tokens, (int, float)) else 0,
+                )
+            except Exception as e:
+                logger.debug("AMS bridge completion failed: %s", e)
 
         return entry
 

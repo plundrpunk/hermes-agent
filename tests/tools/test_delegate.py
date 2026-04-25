@@ -32,6 +32,8 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_ams_bridge_config,
+    _run_single_child,
 )
 
 
@@ -1540,6 +1542,32 @@ class TestDispatchDelegateTask(unittest.TestCase):
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 
+    def test_progress_callback_relays_to_bridge_without_parent_callback(self):
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        received = []
+
+        def bridge_cb(event_type, tool_name=None, preview=None, args=None, **kwargs):
+            received.append((event_type, tool_name, preview, kwargs))
+
+        cb = _build_child_progress_callback(
+            0,
+            "test goal",
+            parent,
+            task_count=1,
+            subagent_id="sa-test",
+            model="gpt-5.4",
+            bridge_event_callback=bridge_cb,
+        )
+
+        cb("subagent.start", preview="test goal")
+        cb(DelegateEvent.TASK_TOOL_STARTED, tool_name="terminal", preview="pwd")
+        cb("subagent.complete", preview="done", status="completed")
+
+        self.assertEqual([item[0] for item in received], ["subagent.start", "subagent.tool", "subagent.complete"])
+        self.assertEqual(received[1][1], "terminal")
+        self.assertEqual(received[0][3]["subagent_id"], "sa-test")
+
     def test_enum_values_are_strings(self):
         for event in DelegateEvent:
             self.assertIsInstance(event.value, str)
@@ -1662,6 +1690,23 @@ class TestDelegateEventEnum(unittest.TestCase):
 
 class TestConcurrencyDefaults(unittest.TestCase):
     """Tests for the concurrency default and no hard ceiling."""
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("tools.delegate_tool._load_config", return_value={"ams_bridge": {"enabled": False}})
+    def test_ams_bridge_disabled_returns_none(self, mock_cfg):
+        parent = _make_mock_parent()
+        self.assertIsNone(_resolve_ams_bridge_config(parent))
+
+    @patch.dict(os.environ, {"AMS_SERVER_URL": "http://ams.local", "AMS_API_KEY": "secret-key"}, clear=True)
+    @patch("tools.delegate_tool._load_config", return_value={"ams_bridge": {"enabled": True, "agent_id": "hermes-test"}})
+    def test_ams_bridge_uses_env_defaults(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.session_id = "session-123"
+        cfg = _resolve_ams_bridge_config(parent)
+        self.assertEqual(cfg["base_url"], "http://ams.local")
+        self.assertEqual(cfg["api_key"], "secret-key")
+        self.assertEqual(cfg["agent_id"], "hermes-test")
+        self.assertEqual(cfg["instance_id"], "session-123")
 
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_default_is_three(self, mock_cfg):
@@ -2160,6 +2205,8 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         )
         self.assertIs(_get_subagent_approval_callback(), _subagent_auto_deny)
 
+
+class TestSubagentAutoApprove(unittest.TestCase):
     @patch(
         "tools.delegate_tool._load_config",
         return_value={"subagent_auto_approve": False},
@@ -2224,6 +2271,49 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         self.assertEqual(seen, [_subagent_auto_deny])
         # Parent's callback slot is still empty (TLS isolates threads).
         self.assertIsNone(_get_approval_callback())
+
+
+class TestBridgeCompletion(unittest.TestCase):
+    @patch("tools.delegate_tool._complete_ams_bridge_execution")
+    @patch("tools.delegate_tool._resolve_ams_bridge_config")
+    def test_run_single_child_reports_bridge_completion(self, mock_resolve_bridge, mock_complete):
+        mock_resolve_bridge.return_value = {
+            "base_url": "http://ams.local",
+            "api_key": "secret",
+            "agent_id": "hermes-agent",
+            "agent_name": "Hermes Agent",
+            "tenant_id": "default",
+            "instance_id": "session-123",
+            "user_id": None,
+            "timeout_seconds": 3.0,
+        }
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child._subagent_id = "sa-bridge"
+        child._delegate_saved_tool_names = []
+        child._credential_pool = None
+        child.tool_progress_callback = None
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        child.session_prompt_tokens = 12
+        child.session_completion_tokens = 7
+        child.model = "gpt-5.4"
+        child.get_activity_summary.return_value = {
+            "current_tool": None,
+            "api_call_count": 1,
+            "max_iterations": 50,
+        }
+
+        entry = _run_single_child(0, "goal", child=child, parent_agent=parent)
+        self.assertEqual(entry["status"], "completed")
+        mock_complete.assert_called_once()
+        kwargs = mock_complete.call_args.kwargs
+        self.assertEqual(kwargs["tokens_in"], 12)
+        self.assertEqual(kwargs["tokens_out"], 7)
 
 
 if __name__ == "__main__":

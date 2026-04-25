@@ -792,6 +792,21 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Optional AMS Observatory bridge for delegate_task children. When enabled,
+        # Hermes registers itself as a Fleet-style AMS agent and mirrors child
+        # execution lifecycle events into Observatory using the existing
+        # /api/fleet register/emit/complete contract.
+        "ams_bridge": {
+            "enabled": False,
+            "base_url": "",      # e.g. "http://127.0.0.1:3001"
+            "api_key": "",       # falls back to AMS_API_KEY env var
+            "tenant_id": "default",
+            "agent_id": "hermes-agent",
+            "agent_name": "Hermes Agent",
+            "instance_id": "",   # empty = parent session_id or hermes-<pid>
+            "user_id": "",       # optional explicit Observatory user scope
+            "timeout_seconds": 3.0,
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
