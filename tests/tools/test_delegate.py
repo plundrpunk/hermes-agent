@@ -2103,11 +2103,26 @@ class TestDelegateHeartbeat(unittest.TestCase):
         session. The fix uses a much higher in-tool threshold and only
         applies the tight idle threshold when current_tool is None.
         """
-        from tools.delegate_tool import _run_single_child
+        from tools.delegate_tool import (
+            _HEARTBEAT_STALE_CYCLES_IDLE,
+            _run_single_child,
+        )
 
         parent = _make_mock_parent()
         touch_calls = []
-        parent._touch_activity = lambda desc: touch_calls.append(desc)
+        # Event-gated (2026-07-29): assert the invariant itself (the idle
+        # stale threshold must not apply while current_tool is set) instead
+        # of a wall-clock touch count, which flaked under CI scheduler
+        # jitter (2-4 touches observed vs 8 ideal).
+        target_touches = _HEARTBEAT_STALE_CYCLES_IDLE + 2
+        past_idle_threshold = threading.Event()
+
+        def _touch(desc):
+            touch_calls.append(desc)
+            if len(touch_calls) >= target_touches:
+                past_idle_threshold.set()
+
+        parent._touch_activity = _touch
 
         child = MagicMock()
         # Child is stuck inside a single terminal call for the whole run.
@@ -2120,22 +2135,19 @@ class TestDelegateHeartbeat(unittest.TestCase):
         }
 
         def slow_run(**kwargs):
-            # Long enough to exceed the OLD idle threshold (5 cycles) at
-            # the patched interval, but shorter than the new in-tool
-            # threshold.
-            time.sleep(0.4)
+            # Block inside the "tool" until the heartbeat proves it kept
+            # firing past the idle threshold. With idle-threshold behavior
+            # the heartbeat loop breaks after _HEARTBEAT_STALE_CYCLES_IDLE
+            # stale cycles, the event never fires, and the hang-guard
+            # timeout returns control so the assertion below fails with a
+            # useful count. The timeout is only a hang guard, not part of
+            # the asserted behavior.
+            past_idle_threshold.wait(timeout=5.0)
             return {"final_response": "done", "completed": True, "api_calls": 1}
 
         child.run_conversation.side_effect = slow_run
 
-        # Use tiny thresholds so the assertion is scheduler-robust in CI:
-        # if idle rules were used for in-tool work, heartbeat would stop after
-        # ~2 cycles. The in-tool branch should keep touching well past that.
-        with (
-            patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05),
-            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
-            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IN_TOOL", 40),
-        ):
+        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05):
             _run_single_child(
                 task_index=0,
                 goal="Test long-running tool",
@@ -2143,12 +2155,13 @@ class TestDelegateHeartbeat(unittest.TestCase):
                 parent_agent=parent,
             )
 
-        # If idle-threshold logic applied, we'd cap around 2 touches; prove we
-        # continued beyond that while inside a long-running tool.
-        self.assertGreater(
-            len(touch_calls), 2,
-            f"Heartbeat stopped too early while child was inside a tool; "
-            f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
+        self.assertTrue(
+            past_idle_threshold.is_set(),
+            f"Heartbeat stopped at or before the idle stale threshold "
+            f"({_HEARTBEAT_STALE_CYCLES_IDLE} cycles) while the child was "
+            f"inside a tool; got {len(touch_calls)} touches, needed "
+            f"{target_touches} - the idle threshold was applied to an "
+            f"in-tool child",
         )
 
 
