@@ -1,4 +1,5 @@
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -7,5 +8,15 @@ import { pathToFileURL } from 'node:url';
 /** @param {string} importMetaUrl @returns {boolean} */
 export function isMain(importMetaUrl) {
     const entry = process.argv[1];
-    return entry !== undefined && importMetaUrl === pathToFileURL(path.resolve(entry)).href;
+    if (entry === undefined) return false;
+    // Node loads the main module by its real path (unless --preserve-symlinks-main), so a
+    // symlinked entry or cwd matches by either spelling.
+    const resolved = path.resolve(entry);
+    let real = resolved;
+    try {
+        real = fs.realpathSync(resolved);
+    } catch {
+        // Missing or unreadable entry: compare the plain spelling only.
+    }
+    return importMetaUrl === pathToFileURL(real).href || importMetaUrl === pathToFileURL(resolved).href;
 }
