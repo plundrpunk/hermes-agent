@@ -66,11 +66,17 @@ async function ping(port: number, token: string): Promise<unknown> {
   }
 }
 
-test.skipIf(process.platform === 'win32')(
-  'a PM source launcher reaches real health and RPC without adopting a legacy venv (POSIX)',
-  async (): Promise<void> => {
+test.skipIf(process.platform === 'win32').each(['directory', 'symlink'])(
+  'a PM source launcher reaches real health and RPC without adopting a legacy venv (POSIX, %s home)',
+  async (homeKind: string): Promise<void> => {
     const temp: string = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-pm-start-'))
     const home: string = path.join(temp, 'home with spaces')
+
+    if (homeKind === 'symlink') {
+      const target: string = path.join(temp, 'real home')
+      fs.mkdirSync(target)
+      fs.symlinkSync(target, home, 'dir')
+    }
 
     const env: NodeJS.ProcessEnv = Object.fromEntries(
       Object.entries(process.env).filter(
